@@ -5,12 +5,18 @@ namespace Laraowl\Client\Tests\Unit;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Illuminate\Redis\Connections\Connection;
-use Laraowl\Client\Console\WorkCommand;
 use Laraowl\Client\HttpIngest;
 use Laraowl\Client\RecordsBuffer;
 use Laraowl\Client\RedisIngest;
 use Laraowl\Client\Tests\TestCase;
 use Mockery;
+
+use function array_keys;
+use function array_map;
+use function array_merge;
+use function array_values;
+use function count;
+use function serialize;
 
 class WorkCommandTest extends TestCase
 {
@@ -72,6 +78,7 @@ class WorkCommandTest extends TestCase
                     }
                     $out[] = [$id, $flat];
                 }
+
                 return $out;
             }
         };
@@ -88,7 +95,7 @@ class WorkCommandTest extends TestCase
             buffer: new RecordsBuffer(length: 10),
         );
 
-        // Stub HttpIngest::transmit so we can assert it received the records.
+        // Stub HttpIngest::transmitWithResult so we can assert it received the records.
         $http = Mockery::mock(HttpIngest::class, [
             'http://laraowl.test',
             'token',
@@ -98,8 +105,10 @@ class WorkCommandTest extends TestCase
         ])->makePartial();
 
         $captured = [];
-        $http->shouldReceive('transmit')->andReturnUsing(function (array $records) use (&$captured): void {
+        $http->shouldReceive('transmitWithResult')->andReturnUsing(function (array $records) use (&$captured): bool {
             $captured = $records;
+
+            return true;
         });
 
         $this->app->instance(RedisIngest::class, $ingest);
@@ -166,6 +175,7 @@ class WorkCommandTest extends TestCase
         $http = Mockery::mock(HttpIngest::class)->makePartial();
         // Should not be called because no valid records were extracted.
         $http->shouldNotReceive('transmit');
+        $http->shouldNotReceive('transmitWithResult');
 
         $this->app->instance(RedisIngest::class, $ingest);
         $this->app->instance(HttpIngest::class, $http);

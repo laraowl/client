@@ -7,6 +7,8 @@ use GuzzleHttp\Exception\GuzzleException;
 use Laraowl\Client\Contracts\Ingest as IngestContract;
 use Throwable;
 
+use function count;
+
 /**
  * @internal
  *
@@ -80,29 +82,54 @@ class HttpIngest implements IngestContract
      * batches drained from a Redis stream without re-implementing the HTTP
      * payload shape.
      *
+     * This method swallows transport failures (matching original behavior
+     * so the host request lifecycle is unaffected by LaraOwl downtime).
+     * Daemons that need to know whether the batch reached the server should
+     * call {@see self::transmitWithResult()} instead — for example, the
+     * `laraowl:work` sidecar uses the boolean return to decide whether
+     * acking the Redis stream is safe.
+     *
      * @param  array<int, array<mixed>>  $records
      */
     public function transmit(array $records): void
     {
+        $this->transmitWithResult($records);
+    }
+
+    /**
+     * Like {@see self::transmit()} but returns whether the upstream POST
+     * actually succeeded. False means the server rejected the batch or the
+     * network call failed — callers that buffer records elsewhere (Redis
+     * stream, on-disk spool) MUST NOT discard the batch when this returns
+     * false, otherwise data is lost silently.
+     *
+     * @param  array<int, array<mixed>>  $records
+     */
+    public function transmitWithResult(array $records): bool
+    {
         $client = new Client([
             'base_uri' => $this->endpoint,
-            'timeout'  => $this->timeout,
+            'timeout' => $this->timeout,
         ]);
 
         try {
-            \Illuminate\Support\Facades\Log::info('Laraowl Attempting to transmit ' . count($records) . ' records to ' . $this->endpoint);
+            \Illuminate\Support\Facades\Log::info('Laraowl Attempting to transmit '.count($records).' records to '.$this->endpoint);
             $client->post('/api/records', [
                 'headers' => [
-                    'Authorization' => 'Bearer ' . $this->token,
-                    'Accept'        => 'application/json',
+                    'Authorization' => 'Bearer '.$this->token,
+                    'Accept' => 'application/json',
                 ],
                 'json' => [
                     'app_url' => $this->app_url,
                     'records' => $records,
                 ],
             ]);
-        } catch (GuzzleException | Throwable $e) {
-            \Illuminate\Support\Facades\Log::error('Laraowl Ingest Error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
+
+            return true;
+        } catch (GuzzleException|Throwable $e) {
+            \Illuminate\Support\Facades\Log::error('Laraowl Ingest Error: '.$e->getMessage()."\n".$e->getTraceAsString());
+
+            return false;
         }
     }
 }
