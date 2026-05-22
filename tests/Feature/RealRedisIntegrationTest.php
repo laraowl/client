@@ -2,7 +2,6 @@
 
 namespace Laraowl\Client\Tests\Feature;
 
-use Illuminate\Support\Facades\Cache;
 use Laraowl\Client\HttpIngest;
 use Laraowl\Client\RecordsBuffer;
 use Laraowl\Client\RedisIngest;
@@ -163,9 +162,14 @@ class RealRedisIntegrationTest extends TestCase
         $ingest->write(['t' => 'query', 'sql' => 'select 2']);
         $ingest->digest();
 
-        // Pretend another worker holds the cluster-wide lock for this stream.
-        $heldLock = Cache::lock('laraowl:work:'.$stream, 0);
-        $this->assertTrue($heldLock->get(), 'External worker took the lock first');
+        // Take the lock against the SAME Redis the worker will check — using
+        // SET NX EX through RedisAdapter so the test does not depend on the
+        // host application's choice of phpredis vs predis vs Relay.
+        $lockKey = $stream.':lock';
+        $externalValue = 'external-owner-'.uniqid('', true);
+        $externalAdapter = $ingest->adapter();
+        $acquired = $externalAdapter->lockAcquire($lockKey, $externalValue, 60);
+        $this->assertTrue($acquired, 'External owner took the lock first');
 
         try {
             $http = Mockery::mock(HttpIngest::class, [
@@ -180,11 +184,17 @@ class RealRedisIntegrationTest extends TestCase
 
             $this->artisan('laraowl:work', ['--once' => true])->assertExitCode(0);
 
-            // Sibling worker exited without touching Redis, so the entry stays.
-            $stillThere = $this->app['redis']->connection('default')->xrange($stream, '-', '+');
+            // Sibling worker exited without draining, so the entry stays on
+            // the stream AND the external owner's value still owns the lock.
+            $stillThere = $externalAdapter->xrange($stream, '-', '+');
             $this->assertCount(1, $stillThere, 'Sibling worker must not have drained the stream');
+            $this->assertSame(
+                $externalValue,
+                $this->app['redis']->connection('default')->get($lockKey),
+                'External owner still holds the lock — sibling did not clobber it'
+            );
         } finally {
-            $heldLock->release();
+            $externalAdapter->lockRelease($lockKey, $externalValue);
         }
     }
 

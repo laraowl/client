@@ -5,7 +5,7 @@ namespace Laraowl\Client\Console;
 use Carbon\CarbonImmutable;
 use Carbon\CarbonInterval;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
 use Laraowl\Client\HttpIngest;
 use Laraowl\Client\RedisIngest;
 use Laraowl\Client\Support\RedisAdapter;
@@ -44,6 +44,7 @@ class WorkCommand extends Command
         {--max-time=0 : Stop after this many seconds (0 = forever).}
         {--once : Drain whatever is currently buffered and exit.}
         {--trim-every=60 : Run XTRIM at most every N seconds.}
+        {--lock-ttl=60 : Single-worker lock TTL in seconds. Auto-renewed mid-drain.}
         {--no-single-worker : Skip the cluster-wide single-worker lock. Use with care.}';
 
     /** @var string */
@@ -66,39 +67,46 @@ class WorkCommand extends Command
         $trimEvery = max(0, (int) $this->option('trim-every'));
         $once = (bool) $this->option('once');
         $skipLock = (bool) $this->option('no-single-worker');
+        $lockTtl = max(5, (int) $this->option('lock-ttl'));
         $stream = $ingest->stream();
         $lastTrim = 0;
+        $adapter = $ingest->adapter();
 
         // Cluster-wide single-worker guard. XRANGE/XDEL is not safe across
         // multiple drainers because two workers can read the same entries
         // before either deletes them — leading to duplicated transmit().
-        // A non-blocking Cache::lock keyed on the stream name lets only one
-        // sidecar actually drain at a time; siblings exit cleanly so the
-        // operator can run them in HA/replicated mode.
         //
-        // The lock is acquired BEFORE the Redis adapter is resolved so a
-        // sibling worker is rejected before it touches Redis at all.
+        // The lock is implemented directly on top of the SAME Redis
+        // connection that holds the stream (SET key NX EX), instead of
+        // Laravel's Cache::lock — that way the lock and the stream share
+        // a single source of truth even when the host application's cache
+        // driver is `array` or some non-shared store, and the lock can
+        // never claim safety it cannot deliver.
+        //
+        // The TTL is finite (default 60s, renewed mid-drain) so a worker
+        // that crashes mid-cycle does not leave the stream undrainable.
         //
         // Pass --no-single-worker to bypass when an external consumer-group
         // scheme is in place.
-        $lock = null;
+        $lockKey = $stream.':lock';
+        $lockValue = (string) Str::uuid();
+        $lockHeld = false;
+        $lastRenew = time();
+
         if (! $skipLock) {
             try {
-                $lock = Cache::lock('laraowl:work:'.$stream, 0);
-                if (! $lock->get()) {
-                    $this->info('laraowl:work another drainer holds the lock for stream ['.$stream.']; exiting.');
-
-                    return self::SUCCESS;
-                }
+                $lockHeld = $adapter->lockAcquire($lockKey, $lockValue, $lockTtl);
             } catch (Throwable $e) {
-                // Cache layer unavailable: fall back to drain without lock
-                // rather than block telemetry entirely.
-                $this->warn('laraowl:work could not acquire single-worker lock ('.$e->getMessage().'); proceeding without it.');
-                $lock = null;
+                $this->warn('laraowl:work lockAcquire failed ('.$e->getMessage().'); proceeding without single-worker guard.');
+                $lockHeld = false;
+            }
+
+            if (! $lockHeld && ! $this->isLockRecoverable($adapter, $lockKey, $lockValue, $lockTtl)) {
+                $this->info('laraowl:work another drainer holds the lock for stream ['.$stream.']; exiting.');
+
+                return self::SUCCESS;
             }
         }
-
-        $adapter = $ingest->adapter();
 
         try {
             while (! $this->shouldStop) {
@@ -112,6 +120,21 @@ class WorkCommand extends Command
                     $this->sleepIfNeeded($sleep);
                 }
 
+                // Renew the lock at roughly half its TTL so a long-running
+                // drain does not lose it.
+                if ($lockHeld && (time() - $lastRenew) >= max(1, (int) ($lockTtl / 2))) {
+                    try {
+                        if (! $adapter->lockRenew($lockKey, $lockValue, $lockTtl)) {
+                            $this->warn('laraowl:work lock no longer owned by us; another drainer may have taken over. Exiting.');
+
+                            return self::SUCCESS;
+                        }
+                    } catch (Throwable $e) {
+                        $this->warn('laraowl:work lockRenew failed: '.$e->getMessage());
+                    }
+                    $lastRenew = time();
+                }
+
                 if ($maxTime > 0 && CarbonImmutable::now()->diffInSeconds($start) >= $maxTime) {
                     $this->info(sprintf('laraowl:work hit --max-time=%ds, exiting.', $maxTime));
 
@@ -123,14 +146,29 @@ class WorkCommand extends Command
 
             return self::SUCCESS;
         } finally {
-            if ($lock !== null) {
+            if ($lockHeld) {
                 try {
-                    $lock->release();
+                    $adapter->lockRelease($lockKey, $lockValue);
                 } catch (Throwable) {
-                    // Lock release is best-effort; the TTL of 0 means it's
-                    // already gone the next time another worker tries.
+                    // Lock release is best-effort; the finite TTL is the
+                    // ultimate stale-recovery mechanism.
                 }
             }
+        }
+    }
+
+    /**
+     * The lock may exist but be in the process of natural expiry — try once
+     * to take ownership if it does not look like an active drainer's. This
+     * prevents an indefinite stall after a worker crashed before the TTL
+     * was set.
+     */
+    protected function isLockRecoverable(RedisAdapter $adapter, string $key, string $value, int $ttl): bool
+    {
+        try {
+            return $adapter->lockAcquire($key, $value, $ttl);
+        } catch (Throwable) {
+            return false;
         }
     }
 

@@ -16,6 +16,7 @@ use function array_map;
 use function array_merge;
 use function array_values;
 use function count;
+use function in_array;
 use function serialize;
 
 class WorkCommandTest extends TestCase
@@ -54,6 +55,11 @@ class WorkCommandTest extends TestCase
                 $this->calls[] = $cmd;
 
                 return match ($cmd) {
+                    // SET key value NX EX ttl — single-worker lock acquire.
+                    // The worker only proceeds when this returns "OK".
+                    'SET' => in_array('NX', $args, true) ? 'OK' : 'OK',
+                    // EVAL is used for lockRenew + lockRelease; report success.
+                    'EVAL' => 1,
                     'XRANGE' => $this->xrangeCall++ === 0
                         ? $this->asLegacyArray($this->serialized)
                         : [],

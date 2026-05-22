@@ -5,6 +5,18 @@ namespace Laraowl\Client\Support;
 use Illuminate\Contracts\Config\Repository;
 use Illuminate\Redis\Connections\Connection;
 use Illuminate\Support\Collection;
+use RuntimeException;
+
+use function array_map;
+use function array_slice;
+use function class_exists;
+use function count;
+use function is_array;
+use function is_object;
+use function is_string;
+use function max;
+use function method_exists;
+use function strtolower;
 
 /**
  * @internal
@@ -97,6 +109,66 @@ class RedisAdapter
     }
 
     /**
+     * Attempt to acquire a distributed lock backed by the same Redis instance
+     * as the stream. Uses SET key value NX EX ttl so two callers can race
+     * deterministically. Returns true when the caller now owns the lock.
+     */
+    public function lockAcquire(string $key, string $value, int $ttl): bool
+    {
+        $result = $this->handle([
+            'SET',
+            $this->prefixed($key),
+            $value,
+            'NX',
+            'EX',
+            (string) max(1, $ttl),
+        ]);
+
+        // phpredis returns true/false; predis returns 'OK'/null. Normalize.
+        return $result === true || $result === 'OK' || $result === 1;
+    }
+
+    /**
+     * Extend the TTL of a lock — but only if the caller still owns it (the
+     * stored value matches). Uses a small Lua script for atomicity so a
+     * worker whose lock expired and was reacquired by someone else cannot
+     * accidentally extend the new holder's lease.
+     */
+    public function lockRenew(string $key, string $value, int $ttl): bool
+    {
+        $script = 'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("EXPIRE", KEYS[1], ARGV[2]) else return 0 end';
+
+        $result = $this->handle([
+            'EVAL',
+            $script,
+            '1',
+            $this->prefixed($key),
+            $value,
+            (string) max(1, $ttl),
+        ]);
+
+        return $result === 1 || $result === true;
+    }
+
+    /**
+     * Release the lock atomically — only if we still own it.
+     */
+    public function lockRelease(string $key, string $value): bool
+    {
+        $script = 'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end';
+
+        $result = $this->handle([
+            'EVAL',
+            $script,
+            '1',
+            $this->prefixed($key),
+            $value,
+        ]);
+
+        return $result === 1 || $result === true;
+    }
+
+    /**
      * Delete entries from a stream.
      *
      * @param  array<int, string>|Collection<int, string>  $ids
@@ -152,7 +224,7 @@ class RedisAdapter
     {
         $prefix = $this->config->get('database.redis.options.prefix', '');
 
-        return (is_string($prefix) ? $prefix : '') . $key;
+        return (is_string($prefix) ? $prefix : '').$key;
     }
 
     /**
@@ -168,6 +240,7 @@ class RedisAdapter
             $out[] = (string) $field;
             $out[] = (string) $value;
         }
+
         return $out;
     }
 
@@ -220,7 +293,7 @@ class RedisAdapter
         $client = $this->connection->client();
 
         if (! is_object($client)) {
-            throw new \RuntimeException('Redis connection did not return an object client.');
+            throw new RuntimeException('Redis connection did not return an object client.');
         }
 
         return $client;
