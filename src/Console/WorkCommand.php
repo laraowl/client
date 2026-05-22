@@ -101,10 +101,14 @@ class WorkCommand extends Command
                 $lockHeld = false;
             }
 
-            if (! $lockHeld && ! $this->isLockRecoverable($adapter, $lockKey, $lockValue, $lockTtl)) {
-                $this->info('laraowl:work another drainer holds the lock for stream ['.$stream.']; exiting.');
+            if (! $lockHeld) {
+                $lockHeld = $this->isLockRecoverable($adapter, $lockKey, $lockValue, $lockTtl);
 
-                return self::SUCCESS;
+                if (! $lockHeld) {
+                    $this->info('laraowl:work another drainer holds the lock for stream ['.$stream.']; exiting.');
+
+                    return self::SUCCESS;
+                }
             }
         }
 

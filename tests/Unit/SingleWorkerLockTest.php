@@ -57,6 +57,58 @@ class SingleWorkerLockTest extends TestCase
         $this->assertGreaterThanOrEqual(1, $stub->evalCalls, 'Worker released the lock via EVAL on the way out');
     }
 
+    public function test_recover_path_marks_lock_held_so_release_runs(): void
+    {
+        // First SET NX EX returns null (lock looks held). The recover attempt
+        // succeeds the second time. This is the path Codex round 3 flagged:
+        // we MUST mark the lock held so renew/release still run, otherwise
+        // the recovered lock would silently expire mid-drain.
+        $stub = new class
+        {
+            public int $xrangeCalls = 0;
+
+            public int $setNxCalls = 0;
+
+            public int $evalCalls = 0;
+
+            public function rawCommand(string $cmd, ...$args): mixed
+            {
+                return match ($cmd) {
+                    'SET' => $this->handleSet($args),
+                    'EVAL' => ++$this->evalCalls,
+                    'XRANGE' => $this->handleXrange(),
+                    'XDEL', 'XTRIM' => 0,
+                    default => null,
+                };
+            }
+
+            private function handleSet(array $args): mixed
+            {
+                if (in_array('NX', $args, true)) {
+                    $this->setNxCalls++;
+
+                    // First attempt blocked; second attempt wins.
+                    return $this->setNxCalls === 1 ? null : 'OK';
+                }
+
+                return 'OK';
+            }
+
+            private function handleXrange(): array
+            {
+                $this->xrangeCalls++;
+
+                return [];
+            }
+        };
+
+        $exit = $this->runWorkerWithStub($stub);
+
+        $this->assertSame(0, $exit);
+        $this->assertSame(2, $stub->setNxCalls, 'Recover path tried SET NX twice');
+        $this->assertGreaterThanOrEqual(1, $stub->evalCalls, 'Recovered lock IS released via EVAL on the way out (not orphaned to TTL)');
+    }
+
     public function test_no_single_worker_flag_skips_lock_acquire(): void
     {
         $stub = $this->makeRedisClientStub(setNxResult: null);
