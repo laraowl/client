@@ -9,8 +9,12 @@ use Throwable;
 
 /**
  * @internal
+ *
+ * Not marked `final` so downstream applications can extend the transport (for
+ * example, wrap transmit() in custom retry/backoff logic) and so test doubles
+ * — including Mockery partial mocks — can replace the network boundary.
  */
-final class HttpIngest implements IngestContract
+class HttpIngest implements IngestContract
 {
     private bool $shouldDigestWhenBufferIsFull = true;
 
@@ -69,7 +73,16 @@ final class HttpIngest implements IngestContract
         $this->transmit($records);
     }
 
-    private function transmit(array $records): void
+    /**
+     * Transmit one or more records to the LaraOwl server.
+     *
+     * Exposed publicly so out-of-process daemons (see WorkCommand) can flush
+     * batches drained from a Redis stream without re-implementing the HTTP
+     * payload shape.
+     *
+     * @param  array<int, array<mixed>>  $records
+     */
+    public function transmit(array $records): void
     {
         $client = new Client([
             'base_uri' => $this->endpoint,

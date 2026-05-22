@@ -41,8 +41,30 @@ return [
     ],
 
     // Transmission Settings
+    //
+    // The `driver` switch selects how records leave the application worker:
+    //   - "http"  — default. Synchronous Guzzle POST inside the request
+    //               lifecycle. Simple, no extra infra, but blocks the worker
+    //               for up to `timeout` seconds per flush and can amplify
+    //               latency under load (see README "Async ingest mode").
+    //   - "redis" — push records to a Redis stream and let `php artisan
+    //               laraowl:work` forward them out-of-band. Worker stays
+    //               unblocked even when the LaraOwl server is slow.
+    //   - "null"  — drop every record. Useful for load tests, ephemeral
+    //               containers, and forensic comparisons.
     'ingest' => [
+        'driver' => env('LARAOWL_INGEST_DRIVER', 'http'),
         'timeout' => (float) env('LARAOWL_INGEST_TIMEOUT', 2.0),
         'buffer_size' => (int) env('LARAOWL_INGEST_BUFFER', 500),
+
+        // Settings used when driver=redis. The sidecar consumes the same
+        // stream/connection via `laraowl:work`.
+        'redis' => [
+            'connection' => env('LARAOWL_INGEST_REDIS_CONNECTION', 'default'),
+            'stream' => env('LARAOWL_INGEST_REDIS_STREAM', 'laraowl:ingest'),
+            // Either an int (MAXLEN entries to retain) or a duration string
+            // accepted by CarbonInterval::fromString (MINID by-age trim).
+            'trim_keep' => env('LARAOWL_INGEST_REDIS_TRIM_KEEP', '5 minutes'),
+        ],
     ],
 ];

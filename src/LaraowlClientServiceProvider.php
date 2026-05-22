@@ -229,15 +229,7 @@ final class LaraowlClientServiceProvider extends ServiceProvider
         $executionState = $this->executionState($uuid->make());
 
         $this->app->instance(Core::class, $this->core = new Core(
-            ingest: new HttpIngest(
-                endpoint: $this->laraowlConfig['server_url'] ?? 'https://laraowl.test',
-                token: $this->laraowlConfig['token'] ?? '',
-                timeout: $this->laraowlConfig['ingest']['timeout'] ?? 2.0,
-                buffer: new RecordsBuffer(
-                    length: $this->laraowlConfig['ingest']['buffer_size'] ?? 500,
-                ),
-                app_url: $this->config->get('app.url'),
-            ),
+            ingest: $this->resolveIngest(),
             sensor: new SensorManager(
                 executionState: $executionState,
                 clock: $clock = new Clock,
@@ -291,7 +283,144 @@ final class LaraowlClientServiceProvider extends ServiceProvider
     {
         $this->commands([
             Console\InstallCommand::class,
+            Console\WorkCommand::class,
         ]);
+    }
+
+    /**
+     * Build the ingest transport selected by `config('laraowl.ingest.driver')`.
+     *
+     * - "redis": push to a Redis stream; sidecar `laraowl:work` forwards out-of-band.
+     * - "null":  drop every record (load tests, smoke runs, forensic comparisons).
+     * - default: HTTP transport (synchronous Guzzle POST, original behavior).
+     *
+     * Unknown driver names fall back to HTTP so misconfiguration cannot silently
+     * turn off telemetry.
+     */
+    private function resolveIngest(): Contracts\Ingest
+    {
+        /** @var mixed $rawIngest */
+        $rawIngest = $this->laraowlConfig['ingest'] ?? [];
+        /** @var array<string, mixed> $ingestConfig */
+        $ingestConfig = is_array($rawIngest) ? $rawIngest : [];
+
+        $driver = strtolower(self::asString($ingestConfig['driver'] ?? 'http', 'http'));
+        $bufferLength = self::asInt($ingestConfig['buffer_size'] ?? 500, 500);
+        $buffer = new RecordsBuffer(length: $bufferLength);
+
+        return match ($driver) {
+            'null', 'none', 'disabled' => $this->resolveNullIngest(),
+            'redis' => $this->resolveRedisIngest($ingestConfig, $buffer),
+            default => $this->resolveHttpIngest($ingestConfig, $buffer),
+        };
+    }
+
+    /**
+     * @param  array<string, mixed>  $ingestConfig
+     */
+    private function resolveHttpIngest(array $ingestConfig, RecordsBuffer $buffer): HttpIngest
+    {
+        $appUrl = $this->config->get('app.url');
+
+        $ingest = new HttpIngest(
+            endpoint: self::asString($this->laraowlConfig['server_url'] ?? 'https://laraowl.test', 'https://laraowl.test'),
+            token: self::asString($this->laraowlConfig['token'] ?? '', ''),
+            timeout: self::asFloat($ingestConfig['timeout'] ?? 2.0, 2.0),
+            buffer: $buffer,
+            app_url: is_string($appUrl) ? $appUrl : null,
+        );
+
+        // Bind the same instance so the work command and integration tests can
+        // depend on the concrete class without paying for a second buffer.
+        $this->app->instance(HttpIngest::class, $ingest);
+
+        return $ingest;
+    }
+
+    /**
+     * @param  array<string, mixed>  $ingestConfig
+     */
+    private function resolveRedisIngest(array $ingestConfig, RecordsBuffer $buffer): RedisIngest
+    {
+        $rawRedis = $ingestConfig['redis'] ?? [];
+        /** @var array<string, mixed> $redisConfig */
+        $redisConfig = is_array($rawRedis) ? $rawRedis : [];
+
+        $appUrl = $this->config->get('app.url');
+
+        $rawTrim = $redisConfig['trim_keep'] ?? '5 minutes';
+        $trimKeep = is_int($rawTrim) ? $rawTrim : self::asString($rawTrim, '5 minutes');
+
+        $ingest = new RedisIngest(
+            redis: $this->app->make(\Illuminate\Contracts\Redis\Factory::class),
+            config: $this->config,
+            connection: self::asString($redisConfig['connection'] ?? 'default', 'default'),
+            stream: self::asString($redisConfig['stream'] ?? 'laraowl:ingest', 'laraowl:ingest'),
+            buffer: $buffer,
+            trimKeep: $trimKeep,
+        );
+
+        // Also build an HttpIngest singleton for the sidecar to use as the
+        // outbound transport when draining the stream.
+        $this->app->instance(RedisIngest::class, $ingest);
+        $this->app->instance(HttpIngest::class, new HttpIngest(
+            endpoint: self::asString($this->laraowlConfig['server_url'] ?? 'https://laraowl.test', 'https://laraowl.test'),
+            token: self::asString($this->laraowlConfig['token'] ?? '', ''),
+            timeout: self::asFloat($ingestConfig['timeout'] ?? 2.0, 2.0),
+            buffer: new RecordsBuffer(length: self::asInt($ingestConfig['buffer_size'] ?? 500, 500)),
+            app_url: is_string($appUrl) ? $appUrl : null,
+        ));
+
+        return $ingest;
+    }
+
+    private function resolveNullIngest(): NullIngest
+    {
+        $ingest = new NullIngest();
+        $this->app->instance(NullIngest::class, $ingest);
+
+        return $ingest;
+    }
+
+    /**
+     * Narrow `mixed` config values to `string` without phpstan complaining about
+     * a `mixed` → `string` cast. Falls back to $default when the value cannot
+     * sensibly be coerced.
+     */
+    private static function asString(mixed $value, string $default): string
+    {
+        if (is_string($value)) {
+            return $value;
+        }
+        if (is_int($value) || is_float($value) || is_bool($value)) {
+            return (string) $value;
+        }
+        return $default;
+    }
+
+    private static function asInt(mixed $value, int $default): int
+    {
+        if (is_int($value)) {
+            return $value;
+        }
+        if (is_string($value) && is_numeric($value)) {
+            return (int) $value;
+        }
+        if (is_float($value)) {
+            return (int) $value;
+        }
+        return $default;
+    }
+
+    private static function asFloat(mixed $value, float $default): float
+    {
+        if (is_float($value) || is_int($value)) {
+            return (float) $value;
+        }
+        if (is_string($value) && is_numeric($value)) {
+            return (float) $value;
+        }
+        return $default;
     }
 
     private function registerSchedule(): void
