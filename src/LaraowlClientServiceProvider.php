@@ -67,8 +67,8 @@ use Laraowl\Client\Hooks\ResponsePreparedListener;
 use Laraowl\Client\Hooks\RouteMatchedListener;
 use Laraowl\Client\Hooks\RouteMiddleware;
 use Laraowl\Client\Hooks\TerminatingListener;
-use Laraowl\Client\Sensors\SecurityAuditSensor;
 use Laraowl\Client\Http\Middleware\Sample;
+use Laraowl\Client\Sensors\SecurityAuditSensor;
 use Laraowl\Client\State\CommandState;
 use Laraowl\Client\State\RequestState;
 use Laraowl\Client\Support\Uuid;
@@ -80,9 +80,7 @@ use Throwable;
 
 use function class_exists;
 use function defined;
-use function hash;
 use function microtime;
-use function substr;
 
 /**
  * @internal
@@ -221,7 +219,6 @@ final class LaraowlClientServiceProvider extends ServiceProvider
         $this->app->singleton(Sample::class, fn () => new Sample($this->core)); // @phpstan-ignore argument.type
     }
 
-
     private function buildAndRegisterCore(): void
     {
         $clock = new Clock;
@@ -316,19 +313,32 @@ final class LaraowlClientServiceProvider extends ServiceProvider
     }
 
     /**
+     * Build a fresh HttpIngest from the ingest config block. Used directly by
+     * the HTTP-driver path and as the outbound sidecar transport on the Redis
+     * driver path. Each call creates its own RecordsBuffer so callers never
+     * accidentally share buffer state.
+     *
+     * @param  array<string, mixed>  $ingestConfig
+     */
+    private function buildHttpIngest(array $ingestConfig): HttpIngest
+    {
+        $appUrl = $this->config->get('app.url');
+
+        return new HttpIngest(
+            endpoint: self::asString($this->laraowlConfig['server_url'] ?? 'https://laraowl.test', 'https://laraowl.test'),
+            token: self::asString($this->laraowlConfig['token'] ?? '', ''),
+            timeout: self::asFloat($ingestConfig['timeout'] ?? 2.0, 2.0),
+            buffer: new RecordsBuffer(length: self::asInt($ingestConfig['buffer_size'] ?? 500, 500)),
+            app_url: is_string($appUrl) ? $appUrl : null,
+        );
+    }
+
+    /**
      * @param  array<string, mixed>  $ingestConfig
      */
     private function resolveHttpIngest(array $ingestConfig, RecordsBuffer $buffer): HttpIngest
     {
-        $appUrl = $this->config->get('app.url');
-
-        $ingest = new HttpIngest(
-            endpoint: self::asString($this->laraowlConfig['server_url'] ?? 'https://laraowl.test', 'https://laraowl.test'),
-            token: self::asString($this->laraowlConfig['token'] ?? '', ''),
-            timeout: self::asFloat($ingestConfig['timeout'] ?? 2.0, 2.0),
-            buffer: $buffer,
-            app_url: is_string($appUrl) ? $appUrl : null,
-        );
+        $ingest = $this->buildHttpIngest($ingestConfig);
 
         // Bind the same instance so the work command and integration tests can
         // depend on the concrete class without paying for a second buffer.
@@ -346,8 +356,6 @@ final class LaraowlClientServiceProvider extends ServiceProvider
         /** @var array<string, mixed> $redisConfig */
         $redisConfig = is_array($rawRedis) ? $rawRedis : [];
 
-        $appUrl = $this->config->get('app.url');
-
         $rawTrim = $redisConfig['trim_keep'] ?? '5 minutes';
         $trimKeep = is_int($rawTrim) ? $rawTrim : self::asString($rawTrim, '5 minutes');
 
@@ -363,13 +371,7 @@ final class LaraowlClientServiceProvider extends ServiceProvider
         // Also build an HttpIngest singleton for the sidecar to use as the
         // outbound transport when draining the stream.
         $this->app->instance(RedisIngest::class, $ingest);
-        $this->app->instance(HttpIngest::class, new HttpIngest(
-            endpoint: self::asString($this->laraowlConfig['server_url'] ?? 'https://laraowl.test', 'https://laraowl.test'),
-            token: self::asString($this->laraowlConfig['token'] ?? '', ''),
-            timeout: self::asFloat($ingestConfig['timeout'] ?? 2.0, 2.0),
-            buffer: new RecordsBuffer(length: self::asInt($ingestConfig['buffer_size'] ?? 500, 500)),
-            app_url: is_string($appUrl) ? $appUrl : null,
-        ));
+        $this->app->instance(HttpIngest::class, $this->buildHttpIngest($ingestConfig));
 
         return $ingest;
     }
