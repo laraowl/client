@@ -94,7 +94,7 @@ final class RedisIngest implements IngestContract
             $adapter->pipeline(function (RedisAdapter $pipe) use ($records, $stream): void {
                 foreach ($records as $record) {
                     $pipe->xadd($stream, [
-                        'data' => serialize($record),
+                        'data' => serialize($this->stripUnserializable($record)),
                     ]);
                 }
             });
@@ -105,6 +105,37 @@ final class RedisIngest implements IngestContract
                 'exception' => $e,
             ]);
         }
+    }
+
+    /**
+     * Strip Closures, resources, and non-JSON-encodable values from a record
+     * so it can be passed through `serialize()` safely.
+     *
+     * Laravel sensors and host application listeners occasionally surface
+     * payloads that contain Closures (logger context, view composers, queued
+     * jobs, etc.). The original HttpIngest path delivered records via Guzzle's
+     * JSON body which silently dropped these. Redis stream entries are passed
+     * through `serialize()` instead — which throws `Serialization of 'Closure'
+     * is not allowed` and causes the whole batch to be lost.
+     *
+     * A JSON round-trip with `JSON_PARTIAL_OUTPUT_ON_ERROR` matches the
+     * legacy lossy-but-safe behavior: unserializable leaves become `null`
+     * but the rest of the record reaches the sidecar intact.
+     *
+     * @param  array<mixed>  $record
+     * @return array<mixed>
+     */
+    private function stripUnserializable(array $record): array
+    {
+        $encoded = json_encode($record, JSON_PARTIAL_OUTPUT_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+
+        if ($encoded === false) {
+            return [];
+        }
+
+        $decoded = json_decode($encoded, true);
+
+        return is_array($decoded) ? $decoded : [];
     }
 
     /**
