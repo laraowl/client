@@ -19,6 +19,14 @@ interface Ingest
      */
     public function writeNow(array $record): void;
 
+    /**
+     * Transmit an already-bufferred batch of records immediately, bypassing
+     * the buffer. Used by the queued job that defers transmission.
+     *
+     * @param  array<int, array<mixed>>  $records
+     */
+    public function transmitBatch(array $records): void;
+
     public function ping(): void;
 
     #[Deprecated('Use shouldDigestWhenBufferIsFull instead')]

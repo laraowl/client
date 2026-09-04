@@ -8,6 +8,7 @@ use Illuminate\Queue\Events\JobReleasedAfterException;
 use Laraowl\Client\Clock;
 use Laraowl\Client\Concerns\NormalizesQueue;
 use Laraowl\Client\Concerns\RecordsContext;
+use Laraowl\Client\Jobs\TransmitRecords;
 use Laraowl\Client\LazyValue;
 use Laraowl\Client\State\CommandState;
 use Laraowl\Client\Types\Str;
@@ -45,6 +46,15 @@ final class JobAttemptSensor
 
         $now = $this->clock->microtime();
         $name = $event->job->resolveName();
+
+        // The package's own transmit job must never generate telemetry about
+        // itself: every job-attempt record it produced would end up in the
+        // buffer, get dispatched as a new job by the next digest(), and that
+        // job's own attempt would do the same — an infinite, self-sustaining
+        // loop of jobs with no real application traffic behind it.
+        if ($name === TransmitRecords::class) {
+            return null;
+        }
 
         return [
             'v' => 1,

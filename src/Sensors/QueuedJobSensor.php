@@ -8,6 +8,7 @@ use Illuminate\Queue\Events\JobQueueing;
 use Laraowl\Client\Clock;
 use Laraowl\Client\Compatibility;
 use Laraowl\Client\Concerns\NormalizesQueue;
+use Laraowl\Client\Jobs\TransmitRecords;
 use Laraowl\Client\Records\QueuedJob;
 use Laraowl\Client\State\CommandState;
 use Laraowl\Client\State\RequestState;
@@ -46,6 +47,15 @@ final class QueuedJobSensor
      */
     public function __invoke(JobQueueing|JobQueued $event): ?array
     {
+        // The package's own transmit job must never generate telemetry about
+        // itself: a "queued-job" record about it would sit in the buffer,
+        // get shipped by the next digest() dispatch of another transmit job,
+        // whose own dispatch would do the same — an infinite, self-sustaining
+        // loop of jobs with no real application traffic behind it.
+        if ($event->job instanceof TransmitRecords) {
+            return null;
+        }
+
         $now = $this->clock->microtime();
 
         if ($event instanceof JobQueueing) {
